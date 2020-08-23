@@ -47,26 +47,30 @@ interface FolderItem {
   val isDirectory: Boolean
   // Is it possible to change lock state: unlock if locked or lock if unlocked
   val canChangeLock: Boolean
+  // Item tags, indicating whether item is local, is read-only, etc
+  val tags: List<String>
 }
 
 private val unsupported = SimpleBooleanProperty(false)
 
-private typealias CellFactory<T> = () -> ListCell<ListViewItem<T>>
-private typealias ExceptionUi = (Exception) -> Unit
+typealias CellFactory<R> = () -> ListCell<ListViewItem<R>>
+typealias ExceptionUi = (Exception) -> Unit
+
 /**
  * Encapsulates a list view showing the contents of a single folder.
  */
 class FolderView<T : FolderItem>(
     val exceptionUi: ExceptionUi,
-    onDeleteResource: Consumer<T> = Consumer {  },
-    onToggleLockResource: Consumer<T> = Consumer {  },
+    onDeleteResource: OnItemAction<T> = {},
+    onToggleLockResource: OnItemAction<T> = {},
     isLockingSupported: BooleanProperty = unsupported,
     isDeleteSupported: ReadOnlyBooleanProperty = unsupported,
-    private val itemActionFactory: ItemActionFactory = Function { Collections.emptyMap() },
-    private val cellFactory: CellFactory<T> = {
-      createListCell(exceptionUi, onDeleteResource, onToggleLockResource, isLockingSupported, isDeleteSupported, itemActionFactory)
-    }) {
+    private val itemActionFactory: ItemActionFactory<T> = Function { Collections.emptyMap() },
+    maybeCellFactory: CellFactory<T>? = null) {
 
+  private val cellFactory: CellFactory<T> = maybeCellFactory ?: {
+    createListCell(exceptionUi, onDeleteResource, onToggleLockResource, isLockingSupported, isDeleteSupported, itemActionFactory)
+  }
   var document: OnlineDocument? = null
   var myContents: ObservableList<T> = FXCollections.observableArrayList()
   val listView: ListView<ListViewItem<T>> = ListView()
@@ -160,11 +164,11 @@ fun <T : FolderItem> createExtractor(): Callback<ListViewItem<T>, Array<Observab
 
 fun <T : FolderItem> createListCell(
     exceptionUi: ExceptionUi,
-    onDeleteResource: Consumer<T>,
-    onToggleLockResource: Consumer<T>,
+    onDeleteResource: OnItemAction<T>,
+    onToggleLockResource: OnItemAction<T>,
     isLockingSupported: BooleanProperty,
     isDeleteSupported: ReadOnlyBooleanProperty,
-    itemActionFactory: ItemActionFactory): ListCell<ListViewItem<T>> {
+    itemActionFactory: ItemActionFactory<T>): ListCell<ListViewItem<T>> {
   return object : ListCell<ListViewItem<T>>() {
     override fun updateItem(item: ListViewItem<T>?, empty: Boolean) {
       try {
@@ -244,16 +248,16 @@ fun <T : FolderItem> createListCell(
             }
 
         if (btnLock != null) {
-          btnLock.addEventHandler(MouseEvent.MOUSE_CLICKED) { onToggleLockResource.accept(item.resource.value) }
+          btnLock.addEventHandler(MouseEvent.MOUSE_CLICKED) { onToggleLockResource(item.resource.value) }
           btnBox.children.add(btnLock)
         }
         if (btnDelete != null) {
-          btnDelete.addEventHandler(ActionEvent.ACTION) { onDeleteResource.accept(item.resource.value) }
+          btnDelete.addEventHandler(ActionEvent.ACTION) { onDeleteResource(item.resource.value) }
           btnBox.children.add(btnDelete)
         }
         itemActionFactory.apply(item.resource.value).forEach { key, action ->
           createButton(key).also {
-            it.addEventHandler(MouseEvent.MOUSE_CLICKED) { action.accept(item.resource.value) }
+            it.addEventHandler(MouseEvent.MOUSE_CLICKED) { action(item.resource.value) }
             btnBox.children.add(it)
           }
         }
@@ -335,7 +339,7 @@ class BreadcrumbView(initialPath: Path, private val onSelectCrumb: Consumer<Path
   fun append(name: String) {
     val selectedPath = breadcrumbs.selectedCrumb.value.path
     val appendPath = selectedPath.resolve(name)
-    val treeItem = TreeItem<BreadcrumbNode>(BreadcrumbNode(appendPath, name))
+    val treeItem = TreeItem(BreadcrumbNode(appendPath, name))
     breadcrumbs.selectedCrumb.children.add(treeItem)
     breadcrumbs.selectedCrumb = treeItem
     onSelectCrumb.accept(appendPath)
@@ -352,8 +356,21 @@ class BreadcrumbView(initialPath: Path, private val onSelectCrumb: Consumer<Path
 
 fun <T : FolderItem> connect(
     filename: TextField?, listView: FolderView<T>, breadcrumbView: BreadcrumbView?,
+    /**
+     * This is called on selection change or on some action with the selected item.
+     * In case of mere selection change both withEnter and withControl are false
+     * In case of double-click or hitting Ctrl+Enter in the list both flags are true.
+     * In case of hitting Enter in the list withEnter == true and withControl == false.
+     * In case of typing in the text search field and hitting Enter, withEnter == true and
+     * withControl depends on whether modifier key is hold.
+     *
+     * Typical expected behavior of the handler:
+     * - both flags false (selection change) may update some UI control state (e.g. disable or enable action button)
+     * - both flags true (dbl-click or Ctrl+Enter) is equivalent to action button click or to opening a folder
+     * - withEnter == true may open a folder or do something with file, depending on what is selected
+     */
     selectItem: (withEnter: Boolean, withControl: Boolean) -> Unit,
-    onFilenameEnter: () -> Unit) {
+    onFilenameEnter: (withEnter: Boolean, withControl: Boolean) -> Unit) {
   listView.listView.onMouseClicked = EventHandler { evt ->
     val dblClick = evt.clickCount == 2
     selectItem(dblClick, dblClick)
@@ -380,20 +397,21 @@ fun <T : FolderItem> connect(
     }
   }
 
-  TextFields.bindAutoCompletion(filename) { req ->
-    // Filter folder with user text and map each item to its name. Return the result if
-    // filtered list has less than 5 items.
-    listView.doFilter(req.userText).let {
-      if (it.size <= 5) it.map { it.name }.toList() else emptyList<String>()
-    }
-  }
+//  TextFields.bindAutoCompletion(filename) { req ->
+//    // Filter folder with user text and map each item to its name. Return the result if
+//    // filtered list has less than 5 items.
+//    listView.doFilter(req.userText).let {
+//      if (it.size <= 5) it.map { it.name }.toList() else emptyList()
+//    }
+//  }
   filename?.onKeyPressed = EventHandler { keyEvent ->
     when (keyEvent.code) {
       KeyCode.DOWN -> listView.requestFocus()
       KeyCode.ENTER -> {
-        onFilenameEnter()
+        onFilenameEnter(true, keyEvent.isControlDown || keyEvent.isMetaDown)
       }
       else -> {
+        onFilenameEnter(false, keyEvent.isControlDown || keyEvent.isMetaDown)
       }
     }
   }

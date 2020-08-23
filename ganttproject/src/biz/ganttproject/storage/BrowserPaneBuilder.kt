@@ -19,7 +19,9 @@ along with GanttProject.  If not, see <http://www.gnu.org/licenses/>.
 package biz.ganttproject.storage
 
 import biz.ganttproject.app.DefaultLocalizer
+import biz.ganttproject.app.DummyLocalizer
 import biz.ganttproject.app.Localizer
+import biz.ganttproject.app.RootLocalizer
 import biz.ganttproject.lib.fx.VBoxBuilder
 import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon
 import de.jensd.fx.glyphs.fontawesome.FontAwesomeIconView
@@ -57,18 +59,18 @@ import java.util.stream.Stream
  *
  * This function is supposed to run asynchronously in a background task.
  */
-typealias Loader = (path: Path, success: Consumer<ObservableList<FolderItem>>, loading: Consumer<Boolean>) -> Unit
+typealias Loader<T> = (path: Path, success: Consumer<ObservableList<T>>, loading: Consumer<Boolean>) -> Unit
 
 /**
  * This function is called when some action happens on some element, e.g. "select",
  * "delete", "open" or "launch".
  */
-typealias OnItemAction = Consumer<FolderItem>
+typealias OnItemAction<T> = (T) -> Unit
 
-typealias ItemActionFactory = Function<FolderItem, Map<String, OnItemAction>>
+typealias ItemActionFactory<T> = Function<FolderItem, Map<String, OnItemAction<T>>>
 
-data class BrowserPaneElements(val breadcrumbView: BreadcrumbView,
-                               val listView: FolderView<FolderItem>,
+data class BrowserPaneElements<T: FolderItem>(val breadcrumbView: BreadcrumbView?,
+                               val listView: FolderView<T>,
                                val filenameInput: CustomTextField,
                                val browserPane: Pane,
                                val busyIndicator: Consumer<Boolean>,
@@ -81,13 +83,13 @@ data class BrowserPaneElements(val breadcrumbView: BreadcrumbView,
  *
  * @author dbarashev@bardsoftware.com
  */
-class BrowserPaneBuilder(
+class BrowserPaneBuilder<T: FolderItem>(
     private val mode: StorageDialogBuilder.Mode,
-    private val dialogUi: StorageDialogBuilder.DialogUi,
-    private val loader: Loader) {
+    private val exceptionUi: ExceptionUi,
+    private val loader: Loader<T>) {
   private val rootPane = VBoxBuilder("pane-service-contents")
 
-  private lateinit var listView: FolderView<FolderItem>
+  private lateinit var listView: FolderView<T>
   private val busyIndicator = StatusBar().apply {
     text = ""
     HBox.setHgrow(this, Priority.ALWAYS)
@@ -97,48 +99,56 @@ class BrowserPaneBuilder(
   }
   private val filename = CustomTextField()
   private val listViewHint = Label().also {
-    it.styleClass.addAll("hint", "noerror")
+    it.styleClass.addAll("hint", "folder-view-hint", "noerror")
   }
   private lateinit var btnSave: Button
 
-  private lateinit var breadcrumbView: BreadcrumbView
+  private var breadcrumbView: BreadcrumbView? = null
   private lateinit var saveBox: HBox
-  private lateinit var onOpenItem: OnItemAction
-  private lateinit var onLaunch: OnItemAction
+  private lateinit var onSelectionChange: OnItemAction<T>
+  private lateinit var onLaunch: OnItemAction<T>
+  private lateinit var onOpenDirectory: OnItemAction<T>
+  private lateinit var onNameTyped: (filename: String, matchedItems: List<T>, withEnter: Boolean, withControl: Boolean) -> Unit
   private var validationSupport: ValidationSupport = ValidationSupport()
   private lateinit var i18n: Localizer
 
   val busyIndicatorToggler: Consumer<Boolean>
     get() = Consumer { Platform.runLater { busyIndicator.progress = if (it) -1.0 else 0.0 } }
 
-  val resultConsumer: Consumer<ObservableList<FolderItem>>
+  val resultConsumer: Consumer<ObservableList<T>>
     get() = Consumer { Platform.runLater { this.listView.setResources(it) } }
 
 
-  fun withI18N(i18n: DefaultLocalizer) {
+  fun withI18N(i18n: Localizer) {
     this.i18n = i18n
   }
 
   fun withListView(
-      onOpenItem: OnItemAction = Consumer {},
-      onLaunch: OnItemAction = Consumer {},
-      onDelete: OnItemAction = Consumer {},
-      onLock: OnItemAction = Consumer {},
+      /** This is called on double-click or Enter */
+      onSelectionChange: OnItemAction<T> = {},
+      onLaunch: OnItemAction<T> = {},
+      onOpenDirectory: OnItemAction<T> = {},
+      onDelete: OnItemAction<T> = {},
+      onLock: OnItemAction<T> = {},
+      onNameTyped: (filename: String, matchedItems: List<T>, withEnter: Boolean, withControl: Boolean) -> Unit = {_,_, _, _ ->},
       canLock: BooleanProperty = SimpleBooleanProperty(false),
       canDelete: ReadOnlyBooleanProperty = SimpleBooleanProperty(false),
-      itemActionFactory: ItemActionFactory = Function { Collections.emptyMap() }) {
+      itemActionFactory: ItemActionFactory<T> = Function { Collections.emptyMap() },
+      cellFactory: CellFactory<T>? = null) {
     this.listView = FolderView(
-        this.dialogUi::error,
+        this.exceptionUi,
         onDelete,
         onLock,
-        canLock, canDelete, itemActionFactory)
-    this.onOpenItem = onOpenItem
+        canLock, canDelete, itemActionFactory, cellFactory)
+    this.onSelectionChange = onSelectionChange
+    this.onOpenDirectory = onOpenDirectory
     this.onLaunch = onLaunch
+    this.onNameTyped = onNameTyped
   }
 
   fun withBreadcrumbs(rootPath: Path) {
     val onSelectCrumb = Consumer { path: Path ->
-      loader(path,
+      this.loader(path,
           resultConsumer,
           busyIndicatorToggler
       )
@@ -147,17 +157,17 @@ class BrowserPaneBuilder(
     this.breadcrumbView = BreadcrumbView(rootPath, onSelectCrumb)
   }
 
-  fun withActionButton(onAction: EventHandler<ActionEvent>) {
+  fun withActionButton(btnSetup: (Button) -> Unit) {
     this.btnSave = Button().also {
       it.textProperty().bind(i18n.create("${this.mode.name.toLowerCase()}.actionLabel"))
     }
-    btnSave.addEventHandler(ActionEvent.ACTION, onAction)
     btnSave.styleClass.add("btn-attention")
 
     this.saveBox = HBox().apply {
       children.addAll(busyIndicator, btnSave)
       styleClass.add("doclist-save-box")
     }
+    btnSetup(btnSave)
   }
 
   fun withValidator(validator: Validator<String>) {
@@ -201,25 +211,32 @@ class BrowserPaneBuilder(
   }
 
   private fun installEventHandlers() {
-    fun selectItem(item: FolderItem, withEnter: Boolean, withControl: Boolean) {
+    fun selectItem(item: T, withEnter: Boolean, withControl: Boolean) {
       when {
+        // It is just selection change. Call the listener and update
+        // filename in the text field unless it is a directory.
+        !withEnter && item.isDirectory -> {
+          this.onSelectionChange(item)
+        }
+        !withEnter && !item.isDirectory -> {
+          this.onSelectionChange(item)
+          filename.text = item.name
+        }
+        // Enter key is hold. We need to distinguish "launch" case (Ctrl+Enter or double-click) for
+        // non-folders vs just Enter.
         withEnter && item.isDirectory -> {
-          breadcrumbView.append(item.name)
-          this.onOpenItem.accept(item)
+          // We just open directories, no matter if Ctrl is hold or not
+          breadcrumbView?.append(item.name)
+          this.onSelectionChange(item)
+          this.onOpenDirectory(item)
           filename.text = ""
         }
         withEnter && !item.isDirectory -> {
-          this.onOpenItem.accept(item)
+          this.onSelectionChange(item)
           filename.text = item.name
           if (withControl) {
-            this.onLaunch.accept(item)
+            this.onLaunch(item)
           }
-        }
-        !withEnter && item.isDirectory -> {
-        }
-        !withEnter && !item.isDirectory -> {
-          this.onOpenItem.accept(item)
-          filename.text = item.name
         }
       }
     }
@@ -228,11 +245,13 @@ class BrowserPaneBuilder(
       listView.selectedResource.ifPresent { item -> selectItem(item, withEnter, withControl) }
     }
 
-    fun onFilenameEnter() {
+    fun onFilenameEnter(withEnter: Boolean, withControl: Boolean) {
       val filtered = listView.doFilter(filename.text)
-      if (filtered.size == 1) {
-        selectItem(filtered[0], true, true)
+      if (filtered.size == 1 && withEnter) {
+        selectItem(filtered[0], withEnter, withEnter)
       }
+      listView.filter(filename.text)
+      onNameTyped(filename.text, filtered, withEnter, withControl)
     }
 
     listView.listView.selectionModel.selectedIndices.addListener(ListChangeListener {
@@ -248,17 +267,17 @@ class BrowserPaneBuilder(
     connect(filename, listView, breadcrumbView, ::selectItem, ::onFilenameEnter)
   }
 
-  fun build(): BrowserPaneElements {
+  fun build(): BrowserPaneElements<T> {
     installEventHandlers()
     rootPane.apply {
       vbox.prefWidth = 400.0
       addTitle(this@BrowserPaneBuilder.i18n.create("${this@BrowserPaneBuilder.mode.name.toLowerCase()}.title")).also {
         it.styleClass.add("title-integrated")
       }
-      add(VBox().also {
-        it.styleClass.add("nav-search")
-        it.children.addAll(
-            breadcrumbView.breadcrumbs,
+      add(VBox().also {vbox ->
+        vbox.styleClass.add("nav-search")
+        breadcrumbView?.let { vbox.children.add(it.breadcrumbs) }
+        vbox.children.addAll(
             filename,
             errorLabel
         )
@@ -277,4 +296,4 @@ private fun formatError(validation: ValidationResult): String {
       .collect(Collectors.joining("\n"))
 }
 
-val BROWSE_PANE_LOCALIZER = DefaultLocalizer("storageService._default")
+val BROWSE_PANE_LOCALIZER = RootLocalizer.createWithRootKey("storageService._default")

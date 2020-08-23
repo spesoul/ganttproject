@@ -18,6 +18,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 package net.sourceforge.ganttproject;
 
+import biz.ganttproject.core.model.task.TaskDefaultColumn;
 import biz.ganttproject.core.option.ValidationException;
 import biz.ganttproject.core.table.ColumnList;
 import biz.ganttproject.core.table.ColumnList.Column;
@@ -51,13 +52,7 @@ import org.jdesktop.swingx.treetable.TreeTableModel;
 
 import javax.annotation.Nullable;
 import javax.swing.*;
-import javax.swing.event.ChangeEvent;
-import javax.swing.event.ListSelectionEvent;
-import javax.swing.event.ListSelectionListener;
-import javax.swing.event.TableColumnModelEvent;
-import javax.swing.event.TableColumnModelListener;
-import javax.swing.event.TreeExpansionEvent;
-import javax.swing.event.TreeExpansionListener;
+import javax.swing.event.*;
 import javax.swing.table.JTableHeader;
 import javax.swing.table.TableCellEditor;
 import javax.swing.table.TableCellRenderer;
@@ -120,7 +115,16 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
   private GPAction myNewRowAction;
   private GPAction myPropertiesAction;
   private TableCellEditor myHierarchicalEditor;
-  private final AtomicBoolean myDoubleClickExpectation = new AtomicBoolean(false);
+  // True value in this field indicates that we have scheduled a task which will start editing
+  // a currently selected edit cell.
+  // See comments in editCellAt method below.
+  private final AtomicBoolean isEditingStartExpected = new AtomicBoolean(false);
+  protected final UIFacade getUiFacade() {
+    return myUiFacade;
+  }
+  protected void setEditingStartExpected(boolean value) {
+    this.isEditingStartExpected.set(value);
+  }
   private final ScheduledExecutorService myEditCellExecutor = Executors.newSingleThreadScheduledExecutor();
   private final Integer myDoubleClickInterval = (Integer) MoreObjects.firstNonNull(Toolkit.getDefaultToolkit().getDesktopProperty("awt.multiClickInterval"), 500);
 
@@ -136,7 +140,7 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
       }
     }
     if (e instanceof MouseEvent) {
-      // Here we have to distinguish between double-click and two consecutive single-clicks.
+      // Here we have to distinguish between double-click/drag start and two consecutive single-clicks.
       // The first single click on a cell should make the cell selected, while single click
       // on selected cell should start editing. The problem is that when user double-clicks
       // a selected cell, single-click event comes first. So in this case we postpone editing start,
@@ -144,7 +148,7 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
       MouseEvent me = (MouseEvent) e;
       if (me.getClickCount() == 2 && me.getButton() == MouseEvent.BUTTON1) {
         // "Cancel" the task and show properties.
-        myDoubleClickExpectation.set(false);
+        setEditingStartExpected(false);
         if (getTable().getSelectedRow() != -1) {
           me.consume();
           myPropertiesAction.actionPerformed(null);
@@ -158,12 +162,13 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
         if (me.isControlDown() || me.isMetaDown() || me.isShiftDown() || me.isAltDown()) {
           return false;
         }
-        // Otherwise wait for double-click a little bit and then start editing.
-        myDoubleClickExpectation.set(true);
+        // Otherwise wait for double-click a little bit and then start editing. Should we
+        // receive double-click or drag start events, we'll reset editing start expectation to false.
+        setEditingStartExpected(true);
         myEditCellExecutor.schedule(new Runnable() {
           @Override
           public void run() {
-            if (myDoubleClickExpectation.get()) {
+            if (isEditingStartExpected.get()) {
               SwingUtilities.invokeLater(new Runnable() {
                 @Override
                 public void run() {
@@ -333,9 +338,14 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
     }
 
     @Override
-    public void importData(ColumnList source) {
+    public void importData(ColumnList source, boolean keepVisibleColumns) {
       for (ColumnImpl column : myColumns) {
-        column.getStub().setVisible(false);
+        if (keepVisibleColumns) {
+          Boolean visible = myTableHeaderFacade.findColumnByID(column.getID()).isVisible();
+          column.getStub().setVisible(visible);
+        } else {
+          column.getStub().setVisible(false);
+        }
       }
       if (!importColumnList(source)) {
         importColumnList(ColumnList.Immutable.fromList(myDefaultColumnStubs));
@@ -579,6 +589,12 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
         putClientProperty("GPTreeTableBase.clearText", false);
       }
     }
+    if (e.getKeyChar() == '>' && ((ks.getModifiers() | KeyEvent.CTRL_DOWN_MASK) > 0)) {
+      return super.processKeyBinding(KeyStroke.getKeyStroke(KeyEvent.VK_GREATER, ks.getModifiers()), e, condition, pressed);
+    }
+    if (e.getKeyChar() == '<' && ((ks.getModifiers() | KeyEvent.CTRL_DOWN_MASK) > 0)) {
+      return super.processKeyBinding(KeyStroke.getKeyStroke(KeyEvent.VK_LESS, ks.getModifiers()), e, condition, pressed);
+    }
     // See also overridden method editCellAt.
     return super.processKeyBinding(ks, e, condition, pressed);
   }
@@ -668,7 +684,7 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
 
   protected void onProjectCreated() {
     getTableHeaderUiFacade().createDefaultColumns(getDefaultColumns());
-    getTableHeaderUiFacade().importData(ColumnList.Immutable.fromList(getDefaultColumns()));
+    getTableHeaderUiFacade().importData(ColumnList.Immutable.fromList(getDefaultColumns()), false);
   }
 
   void initTreeTable() {
@@ -844,7 +860,7 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
         getChart().reset();
       }
     });
-    getTableHeaderUiFacade().importData(ColumnList.Immutable.fromList(getDefaultColumns()));
+    getTableHeaderUiFacade().importData(ColumnList.Immutable.fromList(getDefaultColumns()), false);
 
     // getScrollPane().setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
     getTable().setFillsViewportHeight(true);
@@ -1167,5 +1183,26 @@ public abstract class GPTreeTableBase extends JXTreeTable implements CustomPrope
     column.getTableColumnExt().setPreferredWidth(dimension.width);
     return dimension;
 
+  }
+
+  protected boolean mouseEventHandling(MouseEvent mouseEvent){
+    int index = getTable().columnAtPoint(mouseEvent.getPoint());
+    if (index == -1) {
+      return false;
+    }
+    if (mouseEvent.isPopupTrigger() || mouseEvent.getButton() != MouseEvent.BUTTON1) {
+      return false;
+    }
+    if (mouseEvent.isAltDown() || mouseEvent.isShiftDown() || mouseEvent.isControlDown()) {
+      return false;
+    }
+    return true;
+  }
+
+  protected class ModelListener implements TableModelListener {
+    @Override
+    public void tableChanged(TableModelEvent e) {
+      getUiFacade().getGanttChart().reset();
+    }
   }
 }

@@ -6,9 +6,6 @@
    provider-name="">
 
    <runtime>
-      <library name="biz.ganttproject.core.jar">
-         <export name="*"/>
-      </library>
       <library name="lib/*">
          <export name="*"/>
       </library>
@@ -17,6 +14,7 @@
       </library>
    </runtime>
    <requires>
+      <import plugin="biz.ganttproject.app.libs"/>
       <import plugin="org.eclipse.core.runtime"/>
    </requires>
 </plugin>

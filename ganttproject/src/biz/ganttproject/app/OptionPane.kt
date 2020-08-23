@@ -19,16 +19,18 @@ along with GanttProject.  If not, see <http://www.gnu.org/licenses/>.
 package biz.ganttproject.app
 
 import biz.ganttproject.lib.fx.VBoxBuilder
-import javafx.application.Platform
 import javafx.event.ActionEvent
 import javafx.scene.Node
 import javafx.scene.control.*
+import javafx.scene.layout.BorderPane
 import javafx.scene.layout.Pane
 
 interface I18N {
   fun formatText(key: String, args: Array<Any> = arrayOf()): String
   fun hasKey(key: String): Boolean
 }
+
+const val OPTION_PANE_STYLESHEET = "/biz/ganttproject/app/OptionPane.css"
 
 /**
  * Input data of a single option: its key for i18n purposes, user data for the handler and flag indicating if option
@@ -40,12 +42,14 @@ data class OptionElementData<T>(val i18nKey: String, val userData: T, val isSele
  * This is a helper class which builds a UI widget consisting of a few mutually exclusive options where user is supposed
  * to choose one.
  *
- * The widget can be used inside other widgets or shown in a dialog. It thus becomes slightly more adavnced alternative
+ * The widget can be used inside other widgets or shown in a dialog. It thus becomes slightly more advanced alternative
  * to JOptionPane class.
  */
 class OptionPaneBuilder<T> {
-  val i18n = DefaultLocalizer()
-  val titleString = i18n.create("title")
+  var i18n = RootLocalizer
+  private val titleString: LocalizedString
+      get() = i18n.create("title")
+
   var titleHelpString: LocalizedString? = null
   get() { if (field == null) { field = i18n.create("titleHelp") }; return field }
 
@@ -58,7 +62,7 @@ class OptionPaneBuilder<T> {
   /**
    * Stylesheet which is associated with the widget
    */
-  var styleSheets: MutableList<String> = mutableListOf()
+  var styleSheets: MutableList<String> = mutableListOf(OPTION_PANE_STYLESHEET)
 
   /**
    * Graphic node shown in the left side of the widget
@@ -80,12 +84,6 @@ class OptionPaneBuilder<T> {
 
   private fun buildPaneImpl(lockGroup: ToggleGroup): Pane {
     val vbox = VBoxBuilder()
-    vbox.addTitle(this.titleString.update().value)
-    vbox.add(Label().apply {
-      this.textProperty().bind(this@OptionPaneBuilder.titleHelpString)
-      this.styleClass.add("help")
-    })
-
     this.elements.forEach {
       val btn = RadioButton().also { btn ->
         btn.textProperty().bind(i18n.create(it.i18nKey))
@@ -96,7 +94,7 @@ class OptionPaneBuilder<T> {
       }
       vbox.add(btn)
 
-      if (this.i18n.hasKey("${it.i18nKey}.help")) {
+      if (this.i18n.formatTextOrNull("${it.i18nKey}.help") != null) {
         vbox.add(Label().apply {
           this.textProperty().bind(i18n.create("${it.i18nKey}.help"))
           this.styleClass.add("option-help")
@@ -107,42 +105,44 @@ class OptionPaneBuilder<T> {
     return vbox.vbox
   }
 
-  fun buildDialogPane(optionHandler: (T) -> Unit): DialogPane {
-    return DialogPane().also {
-      this.buildDialogPane(it, optionHandler)
-    }
-  }
-
+  /**
+   * Shows option dialog. When dialog is closed, calls optionHandler with the selected value.
+   */
   fun showDialog(optionHandler: (T) -> Unit) {
-    Platform.runLater {
-      Dialog<Unit>().apply {
-        buildDialogPane(dialogPane, optionHandler)
-        isResizable = true
-        show()
-      }
-    }
-  }
+    dialog {
+      val lockGroup = ToggleGroup()
 
-  private fun buildDialogPane(pane: DialogPane, optionHandler: (T) -> Unit) {
-    val lockGroup = ToggleGroup()
-    val optionsPane = buildPaneImpl(lockGroup)
-    val builder = this
-    pane.apply {
-      styleClass.add(builder.styleClass)
-      stylesheets.addAll(builder.styleSheets)
-      builder.graphic?.let {
-        it.styleClass.add("img")
-        graphic = it
+      this.styleSheets.forEach { styleSheet ->
+        it.addStyleSheet(styleSheet)
       }
+      it.addStyleClass(this.styleClass)
 
-      content = optionsPane
-      content.styleClass.add("content-pane")
-      buttonTypes.add(ButtonType.OK)
-      lookupButton(ButtonType.OK).apply {
-        styleClass.add("btn-attention")
-        addEventHandler(ActionEvent.ACTION) {
-          val userData = lockGroup.selectedToggle.userData as T
-          optionHandler(userData)
+      // Dialog .header inludes .title and .help labels and .img graphic on the right side if specified
+      it.setHeader(
+          BorderPane().apply {
+            styleClass.add("header")
+            center = VBoxBuilder().apply {
+              addTitle(this@OptionPaneBuilder.titleString.update().value)
+              add(Label().apply {
+                this.textProperty().bind(this@OptionPaneBuilder.titleHelpString)
+                this.styleClass.add("help")
+              })
+            }.vbox
+            this@OptionPaneBuilder.graphic?.let {graphic ->
+              this.right = graphic
+              graphic.styleClass.add("img")
+            }
+          }
+      )
+      // Dialog content is .content-pane
+      it.setContent(buildPaneImpl(lockGroup).apply {
+        styleClass.add("option-pane")
+      })
+      // The only available button is OK which is .btn-attention
+      it.setupButton(ButtonType.OK) {btn ->
+        btn.styleClass.add("btn-attention")
+        btn.addEventHandler(ActionEvent.ACTION) {
+          optionHandler(lockGroup.selectedToggle.userData as T)
         }
       }
     }

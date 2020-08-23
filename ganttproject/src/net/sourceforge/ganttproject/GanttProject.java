@@ -1,21 +1,21 @@
 /*
-GanttProject is an opensource project management tool.
-Copyright (C) 2002-2011 Alexandre Thomas, Dmitry Barashev, GanttProject Team
+Copyright 2002-2019 Alexandre Thomas, BarD Software s.r.o
 
-This program is free software; you can redistribute it and/or
-modify it under the terms of the GNU General Public License
-as published by the Free Software Foundation; either version 3
-of the License, or (at your option) any later version.
+This file is part of GanttProject, an open-source project management tool.
 
-This program is distributed in the hope that it will be useful,
+GanttProject is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+
+GanttProject is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License
-along with this program; if not, write to the Free Software
-Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
- */
+along with GanttProject.  If not, see <http://www.gnu.org/licenses/>.
+*/
 package net.sourceforge.ganttproject;
 
 import biz.ganttproject.app.FXSearchUi;
@@ -29,6 +29,7 @@ import biz.ganttproject.core.option.ChangeValueListener;
 import biz.ganttproject.core.option.ColorOption;
 import biz.ganttproject.core.option.DefaultColorOption;
 import biz.ganttproject.core.time.TimeUnitStack;
+import biz.ganttproject.platform.UpdateOptions;
 import biz.ganttproject.storage.cloud.GPCloudOptions;
 import biz.ganttproject.storage.cloud.GPCloudStatusBar;
 import com.beust.jcommander.JCommander;
@@ -55,7 +56,6 @@ import net.sourceforge.ganttproject.chart.GanttChart;
 import net.sourceforge.ganttproject.chart.TimelineChart;
 import net.sourceforge.ganttproject.document.Document;
 import net.sourceforge.ganttproject.document.Document.DocumentException;
-import net.sourceforge.ganttproject.document.DocumentCreator;
 import net.sourceforge.ganttproject.export.CommandLineExportApplication;
 import net.sourceforge.ganttproject.gui.NotificationManager;
 import net.sourceforge.ganttproject.gui.ProjectMRUMenu;
@@ -99,23 +99,18 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
-import java.lang.Thread.UncaughtExceptionHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.security.AccessControlException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
 /**
  * Main frame of the project
  */
 public class GanttProject extends GanttProjectBase implements ResourceView, GanttLanguage.Listener {
-  private static final ExecutorService ourExecutor = Executors.newSingleThreadExecutor();
 
   /**
    * The JTree part.
@@ -267,7 +262,7 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
     }, taskConfig);
     addProjectEventListener(myTaskManager.getProjectListener());
     getActiveCalendar().addListener(myTaskManager.getCalendarListener());
-    ImageIcon icon = new ImageIcon(getClass().getResource("/icons/ganttproject.png"));
+    ImageIcon icon = new ImageIcon(getClass().getResource("/icons/ganttproject-logo-512.png"));
     setIconImage(icon.getImage());
 
 
@@ -282,6 +277,7 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
     options.addOptionGroups(getDocumentManager().getNetworkOptionGroups());
     options.addOptions(GPCloudOptions.INSTANCE.getOptionGroup());
     options.addOptions(getRssFeedChecker().getOptions());
+    options.addOptions(UpdateOptions.INSTANCE.getOptionGroup());
 
     System.err.println("2. loading options");
     initOptions();
@@ -316,7 +312,7 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
     mruMenu.setIcon(new ImageIcon(getClass().getResource("/icons/recent_16.gif")));
     getDocumentManager().addListener(mruMenu);
 
-    myProjectMenu = new ProjectMenu(this, mruMenu, "project");
+    myProjectMenu = new ProjectMenu(this, "project");
     bar.add(myProjectMenu);
 
     myEditMenu = new EditMenu(getProject(), getUIFacade(), getViewManager(), () -> mySearchUi.requestFocus(), "edit");
@@ -660,24 +656,17 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
     return builder.build();
   }
 
-  private void doShow() {
+  void doShow() {
     setVisible(true);
     GPLogger.log(String.format("Bounds after setVisible: %s", getBounds()));
-    try {
-      Class.forName("java.awt.desktop.AboutHandler");
-      DesktopIntegration.setup(GanttProject.this);
-    } catch (ClassNotFoundException e) {
-      if (DesktopIntegration.isMacOs()) {
-        OSXAdapter.registerMacOSXApplication(GanttProject.this);
-      }
-    } finally {
-      OSXAdapter.setupSystemProperties();
-    }
+    DesktopIntegration.setup(GanttProject.this);
     getActiveChart().reset();
     getRssFeedChecker().setOptionsVersion(getGanttOptions().getVersion());
+    getRssFeedChecker().setUpdater(getUpdater());
     getRssFeedChecker().run();
     setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
   }
+
   @Override
   public List<GanttPreviousState> getBaselines() {
     return myPreviousStates;
@@ -718,7 +707,14 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
    */
   public void newProject() {
     getProjectUIFacade().createProject(getProject());
-    fireProjectCreated();
+    try {
+      Document newDocument = getDocumentManager().newUntitledDocument();
+      getProject().setDocument(newDocument);
+      myObservableDocument.set(newDocument);
+      fireProjectCreated();
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
   }
 
   @Override
@@ -742,7 +738,7 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
     if (path != null) {
       final Document document = getDocumentManager().getDocument(path);
       try {
-        getProjectUIFacade().openProject(document, getProject());
+        getProjectUIFacade().openProject(document, getProject(), null);
       } catch (DocumentException e) {
         fireProjectCreated(); // this will create columns in the tables, which are removed by previous call to openProject()
         if (!tryImportDocument(document)) {
@@ -787,19 +783,6 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
   public boolean saveAsProject() {
     getProjectUIFacade().saveProjectAs(getProject());
     return true;
-  }
-
-  /**
-   * Save the project on a file
-   */
-  public void saveProject() {
-    getProjectUIFacade().saveProject(getProject());
-  }
-
-  public void changeWorkingDirectory(String newWorkDir) {
-    if (null != newWorkDir) {
-      options.setWorkingDirectory(newWorkDir);
-    }
   }
 
   /**
@@ -925,16 +908,7 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
    * The main
    */
   public static boolean main(String[] arg) throws InvocationTargetException, InterruptedException {
-    URL logConfig = GanttProject.class.getResource("/logging.properties");
-    if (logConfig != null) {
-      try {
-        GPLogger.readConfiguration(logConfig);
-      } catch (IOException e) {
-        System.err.println("Failed to setup logging: " + e.getMessage());
-        e.printStackTrace();
-      }
-    }
-
+    GPLogger.init();
     CommandLineExportApplication cmdlineApplication = new CommandLineExportApplication();
     final Args mainArgs = new Args();
     try {
@@ -973,52 +947,15 @@ public class GanttProject extends GanttProjectBase implements ResourceView, Gant
       return false;
     }
 
-    Runnable autosaveCleanup = DocumentCreator.createAutosaveCleanup();
 
-    final AtomicReference<GanttSplash> splash = new AtomicReference<>(null);
-    SwingUtilities.invokeLater(new Runnable() {
-      @Override
-      public void run() {
-        splash.set(new GanttSplash());
-        splash.get().setVisible(true);
-      }
+    AppKt.startUiApp(mainArgs, ganttProject -> {
+      ganttProject.setUpdater(org.eclipse.core.runtime.Platform.getUpdater());
+      return null;
     });
-    try {
-      Thread.sleep(1000);
-    } catch (InterruptedException e1) {
-      GPLogger.log(e1);
-    }
-
-
-    AtomicReference<GanttProject> mainWindow = new AtomicReference<>(null);
-    SwingUtilities.invokeAndWait(() -> {
-      try {
-        GanttProject ganttFrame = new GanttProject(false);
-        System.err.println("Main frame created");
-        mainWindow.set(ganttFrame);
-      } catch (Throwable e) {
-        e.printStackTrace();
-      } finally {
-        splash.get().close();
-        System.err.println("Splash closed");
-        Thread.currentThread().setUncaughtExceptionHandler(new UncaughtExceptionHandler() {
-          @Override
-          public void uncaughtException(Thread t, Throwable e) {
-            GPLogger.log(e);
-          }
-        });
-      }
-    });
-
-    SwingUtilities.invokeLater(() -> mainWindow.get().doShow());
-    SwingUtilities.invokeLater(() -> mainWindow.get().doOpenStartupDocument(mainArgs));
-    if (autosaveCleanup != null) {
-      ourExecutor.submit(autosaveCleanup);
-    }
     return true;
   }
 
-  private void doOpenStartupDocument(Args args) {
+  void doOpenStartupDocument(Args args) {
     fireProjectCreated();
     if (args.file != null && !args.file.isEmpty()) {
       openStartupDocument(args.file.get(0));

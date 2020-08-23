@@ -1,3 +1,5 @@
+!define VERSION "2.99"
+!define VERSION_BUILD "2906"
 ; The name of the installer
 !include "MUI.nsh"
 !include "LogicLib.nsh"
@@ -11,7 +13,7 @@ Icon "ganttproject.ico"
 OutFile ganttproject-${VERSION_BUILD}.exe
 
 ; The default installation directory
-InstallDir $PROGRAMFILES\GanttProject-2.8
+InstallDir $PROGRAMFILES\GanttProject-2.99
 
 
 !define MUI_ABORTWARNING
@@ -79,7 +81,8 @@ Section "GanttProject"
   File LICENSE
   File logging.properties
 
-  File /r plugins-${VERSION}
+  File /r plugins
+  File /r runtime
 
   ; Write the installation path into the registry
   WriteRegStr HKLM SOFTWARE\GanttProject "Install_Dir" "$INSTDIR"

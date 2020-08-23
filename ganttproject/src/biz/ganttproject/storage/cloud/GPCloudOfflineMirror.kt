@@ -18,7 +18,7 @@ along with GanttProject.  If not, see <http://www.gnu.org/licenses/>.
 */
 package biz.ganttproject.storage.cloud
 
-import biz.ganttproject.app.DefaultLocalizer
+import biz.ganttproject.app.RootLocalizer
 import biz.ganttproject.lib.fx.VBoxBuilder
 import biz.ganttproject.storage.*
 import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon
@@ -31,6 +31,8 @@ import javafx.geometry.Pos
 import javafx.scene.control.*
 import javafx.scene.layout.Pane
 import javafx.scene.layout.Priority
+import net.sourceforge.ganttproject.document.Document
+import net.sourceforge.ganttproject.document.DocumentManager
 import java.time.Instant
 import java.util.*
 import java.util.function.Consumer
@@ -38,9 +40,9 @@ import java.util.function.Consumer
 /**
  * Represents local offline mirror document in the document browser pane.
  */
-class OfflineMirrorOptionsAsFolderItem(val options: GPCloudFileOptions) : FolderItem {
+class OfflineMirrorOptionsAsFolderItem(val options: GPCloudFileOptions) : CloudJsonAsFolderItem() {
   override val isLockable: Boolean = false
-  override val name: String = options.name
+  override val name: String = options.name.ifBlank { options.offlineMirror ?: "Untitled" }
   override val isDirectory: Boolean = false
   override val canChangeLock: Boolean = false
   override val isLocked: Boolean
@@ -51,7 +53,11 @@ class OfflineMirrorOptionsAsFolderItem(val options: GPCloudFileOptions) : Folder
 /**
  * Builds offline notification pane and offline browser pane.
  */
-class GPCloudOfflinePane(val mode: StorageDialogBuilder.Mode, private val dialogUi: StorageDialogBuilder.DialogUi) {
+class GPCloudOfflinePane(
+    val mode: StorageDialogBuilder.Mode,
+    private val dialogUi: StorageDialogBuilder.DialogUi,
+    private val documentManager: DocumentManager,
+    private val documentConsumer: (Document) -> Unit) {
   var controller: GPCloudStorage.Controller? = null
 
   fun createPane(): Pane {
@@ -114,35 +120,55 @@ class GPCloudOfflinePane(val mode: StorageDialogBuilder.Mode, private val dialog
 
   val browser: Pane by lazy(this::createBrowserPane)
 
+  private val actionButtonHandler = object {
+    private var selectedProject: FolderItem? = null
+
+    fun onSelectionChange(item: FolderItem) {
+      this.selectedProject = item
+    }
+
+    fun onAction() {
+      selectedProject?.let {
+        if (it is OfflineMirrorOptionsAsFolderItem) {
+          it.options.offlineMirror?.let { path ->
+            documentConsumer(documentManager.newDocument(path))
+          }
+        }
+      }
+    }
+  }
+
   private fun createBrowserPane(): Pane {
-    val builder = BrowserPaneBuilder(this.mode, this.dialogUi) { path, success, loading ->
+    val builder = BrowserPaneBuilder<OfflineMirrorOptionsAsFolderItem>(this.mode, this.dialogUi::error) { path, success, loading ->
       loadOfflineMirrors(success)
     }
 
     val paneElements = builder.apply {
-      withI18N(DefaultLocalizer("storageService.cloudOffline", BROWSE_PANE_LOCALIZER))
+      withI18N(RootLocalizer.createWithRootKey("storageService.cloudOffline", BROWSE_PANE_LOCALIZER))
       withBreadcrumbs(DocumentUri(listOf(), true, "Offline Cloud Documents"))
-      withActionButton(EventHandler { })
+      withActionButton {}
       withListView(
-          onOpenItem = Consumer { },
-          onLaunch = Consumer {
-          },
-          itemActionFactory = java.util.function.Function { it ->
-            Collections.emptyMap<String, Consumer<FolderItem>>()
-          }
+          onSelectionChange = actionButtonHandler::onSelectionChange,
+          itemActionFactory = java.util.function.Function { Collections.emptyMap() }
       )
+      withActionButton { btn ->
+        btn.addEventHandler(ActionEvent.ACTION) {
+          actionButtonHandler.onAction()
+        }
+      }
+
     }.build()
     paneElements.browserPane.stylesheets.add("/biz/ganttproject/storage/cloud/GPCloudStorage.css")
     return paneElements.browserPane
   }
 }
 
-fun loadOfflineMirrors(consumer: Consumer<ObservableList<FolderItem>>) {
-  val mirrors = GPCloudOptions.cloudFiles.files.entries.map { (fp, options) ->
+fun <T: CloudJsonAsFolderItem> loadOfflineMirrors(consumer: Consumer<ObservableList<T>>) {
+  val mirrors = GPCloudOptions.cloudFiles.files.entries.mapNotNull { (fp, options) ->
     options.offlineMirror?.let {
       OfflineMirrorOptionsAsFolderItem(options)
     }
-  }.filterNotNull()
-  consumer.accept(FXCollections.observableArrayList<FolderItem>(mirrors))
+  }
+  consumer.accept(FXCollections.observableArrayList(mirrors) as ObservableList<T>)
 }
 

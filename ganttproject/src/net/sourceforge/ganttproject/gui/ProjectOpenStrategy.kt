@@ -21,6 +21,7 @@ package net.sourceforge.ganttproject.gui
 
 import biz.ganttproject.app.OptionElementData
 import biz.ganttproject.app.OptionPaneBuilder
+import biz.ganttproject.app.RootLocalizer
 import biz.ganttproject.core.option.DefaultEnumerationOption
 import biz.ganttproject.core.time.TimeDuration
 import biz.ganttproject.storage.FetchResult
@@ -35,6 +36,7 @@ import javafx.beans.value.ObservableValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Runnable
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import net.sourceforge.ganttproject.GPLogger
 import net.sourceforge.ganttproject.IGanttProject
@@ -100,49 +102,59 @@ internal class ProjectOpenStrategy(project: IGanttProject, uiFacade: UIFacade) :
     }
   }
 
-  fun open(document: Document, offlineTail: (Document) -> Unit) {
-    val online = document.asOnlineDocument() ?: return offlineTail(document)
-    GlobalScope.launch(Dispatchers.Main) {
-      val currentFetch = online.fetchResultProperty.get() ?: online.fetch()
-      if (processFetchResult(currentFetch)) {
-        offlineTail(document)
+  suspend fun open(document: Document, successChannel: Channel<Document>) {
+    GlobalScope.launch(Dispatchers.IO) {
+      val online = document.asOnlineDocument()
+      if (online == null) {
+        successChannel.send(document)
+      } else {
+        try {
+          val currentFetch = online.fetchResultProperty.get() ?: online.fetch().also { it.update() }
+          processFetchResult(currentFetch, document, successChannel)
+        } catch (ex: Exception) {
+          successChannel.close(ex)
+        }
       }
     }
   }
 
-  private suspend fun processFetchResult(fetchResult: FetchResult): Boolean {
+  private suspend fun processFetchResult(fetchResult: FetchResult, document: Document, successChannel: Channel<Document>) {
     val onlineDoc = fetchResult.onlineDocument
     val mirrorDoc = onlineDoc.offlineMirror
-    val offlineChecksum = mirrorDoc?.checksum() ?: return true
+    val offlineChecksum = mirrorDoc?.checksum()
+    if (offlineChecksum == null) {
+      successChannel.send(document)
+      return
+    }
     if (offlineChecksum == fetchResult.actualChecksum) {
       // Offline mirror and actual file online are identical, only version could change
       // Just read the online
-      return true
+      successChannel.send(document)
+      return
     }
     if (fetchResult.syncVersion == fetchResult.actualVersion) {
       // This is the case when we have local modifications not yet written online,
       // e.g. because we have been offline for a while and went online
       // when GP was closed.
-      return suspendCoroutine { continuation -> showOfflineIsAheadDialog(continuation, fetchResult) }
+      showOfflineIsAheadDialog(fetchResult, document, successChannel)
     } else {
       // Online is different from mirror, and we have to find out if we had
       // any offline modifications.
-      return if (offlineChecksum == fetchResult.syncChecksum) {
-        // No local modifications comparing to the last sync
-        true
+      if (offlineChecksum == fetchResult.syncChecksum) {
+        successChannel.send(document)
+        return
       } else {
         // Files modified both locally and online. Ask user which one wins
-        suspendCoroutine { continuation -> showForkDialog(continuation, fetchResult) }
+        showForkDialog(fetchResult, document, successChannel)
       }
     }
-
   }
 
   enum class OpenOnlineDocumentChoice { USE_OFFLINE, USE_ONLINE, CANCEL }
 
-  private fun showOfflineIsAheadDialog(continuation: Continuation<Boolean>, fetchResult: FetchResult) {
+  private fun showOfflineIsAheadDialog(fetchResult: FetchResult, document: Document, successChannel: Channel<Document>) {
     OptionPaneBuilder<OpenOnlineDocumentChoice>().run {
-      i18n.rootKey = "cloud.openWhenOfflineIsAhead"
+      i18n = RootLocalizer.createWithRootKey(rootKey = "cloud.openWhenOfflineIsAhead")
       styleClass = "dlg-lock"
       styleSheets.add("/biz/ganttproject/storage/cloud/GPCloudStorage.css")
       styleSheets.add("/biz/ganttproject/storage/StorageDialog.css")
@@ -157,22 +169,26 @@ internal class ProjectOpenStrategy(project: IGanttProject, uiFacade: UIFacade) :
         when (choice) {
           OpenOnlineDocumentChoice.USE_OFFLINE -> {
             fetchResult.useMirror = true
-            continuation.resume(true)
+            GlobalScope.launch {
+              successChannel.send(document)
+            }
           }
           OpenOnlineDocumentChoice.USE_ONLINE -> {
-            continuation.resume(true)
+            GlobalScope.launch {
+              successChannel.send(document)
+            }
           }
           OpenOnlineDocumentChoice.CANCEL -> {
-            continuation.resume(false)
+
           }
         }
       }
     }
   }
 
-  private fun showForkDialog(continuation: Continuation<Boolean>, fetchResult: FetchResult) {
+  private fun showForkDialog(fetchResult: FetchResult, document: Document, successChannel: Channel<Document>) {
     OptionPaneBuilder<OpenOnlineDocumentChoice>().run {
-      i18n.rootKey = "cloud.openWhenDiverged"
+      i18n = RootLocalizer.createWithRootKey(rootKey = "cloud.openWhenDiverged")
       styleClass = "dlg-lock"
       styleSheets.add("/biz/ganttproject/storage/cloud/GPCloudStorage.css")
       styleSheets.add("/biz/ganttproject/storage/StorageDialog.css")
@@ -187,13 +203,16 @@ internal class ProjectOpenStrategy(project: IGanttProject, uiFacade: UIFacade) :
         when (choice) {
           OpenOnlineDocumentChoice.USE_OFFLINE -> {
             fetchResult.useMirror = true
-            continuation.resume(true)
+            GlobalScope.launch {
+              successChannel.send(document)
+            }
           }
           OpenOnlineDocumentChoice.USE_ONLINE -> {
-            continuation.resume(true)
+            GlobalScope.launch {
+              successChannel.send(document)
+            }
           }
           OpenOnlineDocumentChoice.CANCEL -> {
-            continuation.resume(false)
           }
         }
       }

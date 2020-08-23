@@ -22,6 +22,7 @@ import biz.ganttproject.storage.*
 import com.evanlennick.retry4j.CallExecutorBuilder
 import com.evanlennick.retry4j.config.RetryConfigBuilder
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.node.ObjectNode
 import com.google.common.base.Strings
 import com.google.common.hash.Hashing
@@ -29,6 +30,9 @@ import com.google.common.io.ByteStreams
 import javafx.beans.property.SimpleBooleanProperty
 import javafx.beans.property.SimpleObjectProperty
 import javafx.event.EventHandler
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import net.sourceforge.ganttproject.document.AbstractURLDocument
 import net.sourceforge.ganttproject.document.Document
@@ -49,9 +53,6 @@ import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.function.Consumer
 
-// HTTP server for sign in into GP Cloud
-typealias AuthTokenCallback = (token: String?, validity: String?, userId: String?, websocketToken: String?) -> Unit
-
 typealias OfflineDocumentFactory = (path: String) -> Document?
 typealias ProxyDocumentFactory = (document: Document) -> Document
 
@@ -59,7 +60,7 @@ private val ourExecutor = Executors.newSingleThreadExecutor()
 
 class GPCloudDocument(private val teamRefid: String?,
                       private val teamName: String,
-                      private val projectRefid: String?,
+                      internal var projectRefid: String?,
                       private val projectName: String,
                       val projectJson: ProjectJsonAsFolderItem?)
   : AbstractURLDocument(), LockableDocument, OnlineDocument {
@@ -69,11 +70,14 @@ class GPCloudDocument(private val teamRefid: String?,
   override val status = SimpleObjectProperty<LockStatus>()
   override val mode = SimpleObjectProperty<OnlineDocumentMode>(OnlineDocumentMode.ONLINE_ONLY)
   override val fetchResultProperty = SimpleObjectProperty<FetchResult>()
+  override val latestVersionProperty = SimpleObjectProperty<LatestVersion>(this, "")
 
   private val queryArgs: String
     get() = "?projectRefid=${this.projectRefid}"
 
-  val projectIdFingerprint = Hashing.farmHashFingerprint64().hashUnencodedChars(this.projectRefid!!).toString()
+  val projectIdFingerprint get() = this.projectRefid?.let {
+    Hashing.farmHashFingerprint64().hashUnencodedChars(it).toString()
+  } ?: ""
 
   var offlineDocumentFactory: OfflineDocumentFactory = { null }
   var proxyDocumentFactory: ProxyDocumentFactory = { doc -> doc }
@@ -266,7 +270,7 @@ class GPCloudDocument(private val teamRefid: String?,
   }
 
   override fun getInputStream(): InputStream {
-    var fetchResult = this.fetchResultProperty.get() ?: runBlocking { fetch() }
+    var fetchResult = this.fetchResultProperty.get() ?: runBlocking { fetch().also { it.update() }}
     if (fetchResult.useMirror) {
       val mirrorBytes = this.offlineMirror!!.inputStream.readBytes()
       saveOnline(mirrorBytes)
@@ -278,35 +282,40 @@ class GPCloudDocument(private val teamRefid: String?,
   }
 
   override suspend fun fetch(): FetchResult {
-    return callReadProject().also {
-      this.fetchResultProperty.set(it)
-    }
+    return callReadProject()
   }
 
   override suspend fun fetchVersion(version: Long): FetchResult {
-    return callReadProject(version).also {
-      this.fetchResultProperty.set(it)
-    }
+    return callReadProject(version)
   }
 
+  @Throws(ForbiddenException::class)
   private fun callReadProject(version: Long = -1): FetchResult {
     val http = this.httpClientFactory()
     val resp = if (version == -1L) http.sendGet("/p/read$queryArgs") else http.sendGet("/p/read$queryArgs&generation=$version")
-    if (resp.code == 200) {
-      val etagValue = resp.header("ETag")
-      val digestValue = resp.header("Digest")?.substringAfter("crc32c=")
+    when (resp.code) {
+      200 -> {
+        val etagValue = resp.header("ETag")
+        val digestValue = resp.header("Digest")?.substringAfter("crc32c=")
 
-      val documentBody = resp.body
+        val documentBody = resp.decodedBody
 
-      return FetchResult(
-          this@GPCloudDocument,
-          this.mirrorOptions?.lastOnlineChecksum ?: "",
-          this.mirrorOptions?.lastOnlineVersion?.toLong() ?: -1L,
-          digestValue ?: "",
-          etagValue?.toLong() ?: -1,
-          documentBody)
-    } else {
-      throw IOException("Failed to read from GanttProject Cloud: got response ${resp.code} : ${resp.reason}")
+        return FetchResult(
+            this@GPCloudDocument,
+            this.mirrorOptions?.lastOnlineChecksum ?: "",
+            this.mirrorOptions?.lastOnlineVersion?.toLong() ?: -1L,
+            digestValue ?: "",
+            etagValue?.toLong() ?: -1,
+            documentBody,
+            fetchResultProperty::setValue
+        )
+      }
+      403 -> {
+        throw ForbiddenException()
+      }
+      else -> {
+        throw IOException("Failed to read from GanttProject Cloud: got response ${resp.code} : ${resp.reason}")
+      }
     }
   }
 
@@ -342,12 +351,14 @@ class GPCloudDocument(private val teamRefid: String?,
     }
   }
 
-  @Throws(NetworkUnavailableException::class)
+  private val OBJECT_MAPPER = ObjectMapper()
+
+  @Throws(NetworkUnavailableException::class, VersionMismatchException::class, ForbiddenException::class)
   private fun saveOnline(body: ByteArray) {
     val http = this.httpClientFactory()
     try {
       val resp = http.sendPost("/p/write", mapOf(
-          "projectRefid" to this.projectRefid,
+          "projectRefid" to this.projectRefid.orEmpty(),
           "teamRefid" to this.teamRefid,
           "filename" to this.projectName,
           "fileContents" to Base64.getEncoder().encodeToString(body),
@@ -358,16 +369,24 @@ class GPCloudDocument(private val teamRefid: String?,
         200 -> {
           val etagValue = resp.header("ETag")
           val digestValue = resp.header("Digest")?.substringAfter("crc32c=")
+
+          val response = OBJECT_MAPPER.readValue(resp.rawBody, ProjectWriteResponse::class.java)
+          println(response)
+          this.projectRefid = response.projectRefid
           val fetch = FetchResult(
               this@GPCloudDocument,
               this.mirrorOptions?.lastOnlineChecksum ?: "",
               this.mirrorOptions?.lastOnlineVersion?.toLong() ?: -1L,
               digestValue ?: "",
               etagValue?.toLong() ?: -1,
-              body)
+              body,
+              fetchResultProperty::setValue
+          )
           this.saveOfflineMirror(fetch)
-          this.fetchResultProperty.set(fetch)
-
+          fetch.update()
+        }
+        403 -> {
+          throw ForbiddenException()
         }
         412 -> {
           throw VersionMismatchException()
@@ -380,7 +399,7 @@ class GPCloudDocument(private val teamRefid: String?,
           }
         }
         else -> {
-          val respBody = resp.body.toString(com.google.common.base.Charsets.UTF_8)
+          val respBody = resp.decodedBody.toString(com.google.common.base.Charsets.UTF_8)
           println(respBody)
           throw IOException("Failed to write to GanttProject Cloud. Got HTTP ${resp.code}: ${resp.reason}")
         }
@@ -410,16 +429,31 @@ class GPCloudDocument(private val teamRefid: String?,
 
   override fun isLocal(): Boolean = false
 
-  fun listenLockChange(webSocket: WebSocketClient) {
-    webSocket.onLockStatusChange { msg ->
-      println(msg)
-      if (!msg["locked"].booleanValue()) {
-        this.status.set(LockStatus(false))
-      } else {
-        this.status.set(LockStatus(locked = true,
-            lockOwnerName = msg.path("author")?.path("name")?.textValue(),
-            lockOwnerEmail = null,
-            lockOwnerId = msg.path("author")?.path("id")?.textValue()))
+  fun listenEvents(webSocket: WebSocketClient) {
+    webSocket.apply {
+      onLockStatusChange { msg ->
+        if (!msg["locked"].booleanValue()) {
+          status.set(LockStatus(false))
+        } else {
+          status.set(LockStatus(locked = true,
+              lockOwnerName = msg.path("author")?.path("name")?.textValue(),
+              lockOwnerEmail = null,
+              lockOwnerId = msg.path("author")?.path("id")?.textValue()))
+        }
+      }
+
+      onContentChange { msg -> GlobalScope.launch(Dispatchers.IO) { onWebSocketContentChange(msg) }}
+    }
+  }
+
+  internal suspend fun onWebSocketContentChange(msg: ObjectNode) {
+    if (msg["projectRefid"].textValue() == projectRefid) {
+      val timestamp = msg["timestamp"]?.asLong() ?: return
+      val author = msg["author"]?.get("name")?.textValue() ?: return
+      fetch().also {
+        if (it.actualVersion != fetchResultProperty.get().actualVersion) {
+          latestVersionProperty.set(LatestVersion(timestamp, author))
+        }
       }
     }
   }
@@ -432,14 +466,14 @@ class GPCloudDocument(private val teamRefid: String?,
     lockService.project = this.projectJson!!
     lockService.busyIndicator = Consumer {}
     lockService.requestLockToken = true
-    lockService.duration = if (duration != null) duration else Duration.ZERO
+    lockService.duration = duration ?: Duration.ZERO
     lockService.onSucceeded = EventHandler {
       val status = json2lockStatus(lockService.value)
       val projectNode = this.projectJson.node
       if (projectNode is ObjectNode) {
         projectNode.set("lock", lockService.value)
       }
-
+      this.lock = lockService.value
       result.complete(status)
     }
     lockService.onFailed = EventHandler { result.completeExceptionally(RuntimeException("Failed")) }
@@ -473,3 +507,4 @@ class GPCloudDocument(private val teamRefid: String?,
     executor.execute(callable)
   }
 }
+

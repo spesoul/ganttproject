@@ -21,13 +21,22 @@ package net.sourceforge.ganttproject.gui
 
 import biz.ganttproject.app.OptionElementData
 import biz.ganttproject.app.OptionPaneBuilder
+import biz.ganttproject.app.RootLocalizer
+import biz.ganttproject.app.dialog
 import biz.ganttproject.core.option.GPOptionGroup
-import biz.ganttproject.storage.StorageDialogAction
-import biz.ganttproject.storage.VersionMismatchException
-import biz.ganttproject.storage.asOnlineDocument
+import biz.ganttproject.storage.*
+import biz.ganttproject.storage.cloud.AuthTokenCallback
+import biz.ganttproject.storage.cloud.GPCloudOptions
+import biz.ganttproject.storage.cloud.SigninPane
+import biz.ganttproject.storage.cloud.onAuthToken
 import com.google.common.collect.Lists
 import de.jensd.fx.glyphs.fontawesome.FontAwesomeIcon
 import de.jensd.fx.glyphs.fontawesome.FontAwesomeIconView
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import net.sourceforge.ganttproject.GPLogger
 import net.sourceforge.ganttproject.IGanttProject
 import net.sourceforge.ganttproject.action.CancelAction
@@ -35,6 +44,7 @@ import net.sourceforge.ganttproject.action.GPAction
 import net.sourceforge.ganttproject.document.Document
 import net.sourceforge.ganttproject.document.Document.DocumentException
 import net.sourceforge.ganttproject.document.DocumentManager
+import net.sourceforge.ganttproject.document.FileDocument
 import net.sourceforge.ganttproject.document.webdav.WebDavStorageImpl
 import net.sourceforge.ganttproject.filter.GanttXMLFileFilter
 import net.sourceforge.ganttproject.gui.projectwizard.NewProjectWizard
@@ -52,18 +62,32 @@ import javax.swing.JFileChooser
 import javax.swing.JOptionPane
 import javax.swing.SwingUtilities
 
-class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val documentManager: DocumentManager, private val undoManager: GPUndoManager) : ProjectUIFacade {
+class ProjectUIFacadeImpl(
+    private val myWorkbenchFacade: UIFacade,
+    private val documentManager: DocumentManager,
+    private val undoManager: GPUndoManager) : ProjectUIFacade {
   private val i18n = GanttLanguage.getInstance()
 
   private val myConverterGroup = GPOptionGroup("convert", ProjectOpenStrategy.milestonesOption)
 
-  override fun saveProject(project: IGanttProject) {
-    if (project.document == null) {
-      saveProjectAs(project)
-      return
+  override fun saveProject(project: IGanttProject, onFinish: Channel<Boolean>?) {
+    GlobalScope.launch {
+      if (project.document == null) {
+        saveProjectAs(project)
+        onFinish?.send(true)
+        return@launch
+      }
+
+      if (project.document.asLocalDocument()?.canRead() == false) {
+        saveProjectAs(project)
+        onFinish?.send(true)
+        return@launch
+      }
+
+      val document = project.document
+      saveProjectTryWrite(project, document)
+      onFinish?.send(true)
     }
-    val document = project.document
-    saveProjectTryWrite(project, document)
   }
 
   private fun saveProjectTryWrite(project: IGanttProject, document: Document): Boolean {
@@ -99,15 +123,15 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
   enum class VersionMismatchChoice { OVERWRITE, MAKE_COPY }
 
   private fun saveProjectTrySave(project: IGanttProject, document: Document): Boolean {
-    val onlineDoc = document.asOnlineDocument()
     try {
       saveProject(document)
       afterSaveProject(project)
       return true
     } catch (e: VersionMismatchException) {
+      val onlineDoc = document.asOnlineDocument()
       if (onlineDoc != null) {
         OptionPaneBuilder<VersionMismatchChoice>().also {
-          it.i18n.rootKey = "cloud.versionMismatch"
+          it.i18n = RootLocalizer.createWithRootKey(rootKey = "cloud.versionMismatch")
           it.styleClass = "dlg-lock"
           it.styleSheets.add("/biz/ganttproject/storage/cloud/GPCloudStorage.css")
           it.styleSheets.add("/biz/ganttproject/storage/StorageDialog.css")
@@ -135,6 +159,11 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
         }
       }
       return false
+    } catch (e: ForbiddenException) {
+      signin {
+        saveProjectTrySave(project, document)
+      }
+      return false
     } catch (e: Throwable) {
       myWorkbenchFacade.showErrorDialog(e)
       return false
@@ -142,6 +171,19 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
 
   }
 
+  private fun signin(onAuth: ()->Unit) {
+    dialog {
+      val onAuthToken: AuthTokenCallback = { token, validity, userId, websocketToken ->
+        GPCloudOptions.onAuthToken().invoke(token, validity, userId, websocketToken)
+        it.hide()
+        onAuth()
+      }
+      it.addStyleClass("dlg-lock", "dlg-cloud-file-options")
+      it.addStyleSheet("/biz/ganttproject/storage/cloud/GPCloudStorage.css", "/biz/ganttproject/storage/StorageDialog.css")
+      val pane = SigninPane(onAuthToken)
+      it.setContent(pane.createSigninPane())
+    }
+  }
   private fun formatWriteStatusMessage(doc: Document, canWrite: IStatus): String {
     assert(canWrite.code >= 0 && canWrite.code < Document.ErrorCode.values().size)
     val errorCode = Document.ErrorCode.values()[canWrite.code]
@@ -166,13 +208,13 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
 
   @Throws(IOException::class)
   private fun saveProject(document: Document) {
-    myWorkbenchFacade.setStatusText(GanttLanguage.getInstance().getText("saving") + " " + document.path)
+    //myWorkbenchFacade.setStatusText(GanttLanguage.getInstance().getText("saving") + " " + document.path)
     document.write()
   }
 
   override fun saveProjectAs(project: IGanttProject) {
-    StorageDialogAction(project, myWorkbenchFacade, this, project.documentManager,
-        (project.documentManager.webDavStorageUi as WebDavStorageImpl).serversOption).actionPerformed(null)
+    StorageDialogAction(project, this, project.documentManager,
+        (project.documentManager.webDavStorageUi as WebDavStorageImpl).serversOption, StorageDialogBuilder.Mode.SAVE, "project.save").actionPerformed(null)
   }
 
   /**
@@ -190,15 +232,15 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
         return false
       }
       if (UIFacade.Choice.YES == saveChoice) {
-        try {
-          saveProject(project)
+        return try {
+          saveProject(project, null)
           // If all those complex save procedures complete successfully and project gets saved
           // then its modified state becomes false
           // Otherwise it remains true which means we have not saved and can't continue
-          return !project.isModified
+          !project.isModified
         } catch (e: Exception) {
           myWorkbenchFacade.showErrorDialog(e)
-          return false
+          false
         }
 
       }
@@ -208,7 +250,7 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
 
   @Throws(IOException::class, DocumentException::class)
   override fun openProject(project: IGanttProject) {
-    if (false == ensureProjectSaved(project)) {
+    if (!ensureProjectSaved(project)) {
       return
     }
     val fc = JFileChooser(documentManager.workingDirectory)
@@ -224,32 +266,52 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
     val returnVal = fc.showOpenDialog(myWorkbenchFacade.mainFrame)
     if (returnVal == JFileChooser.APPROVE_OPTION) {
       val document = documentManager.getDocument(fc.selectedFile.absolutePath)
-      openProject(document, project)
+      openProject(document, project, null)
     }
   }
 
   @Throws(IOException::class, DocumentException::class)
-  override fun openProject(document: Document, project: IGanttProject) {
-
-    beforeClose()
-    project.close()
-
+  override fun openProject(document: Document, project: IGanttProject, onFinish: Channel<Boolean>?) {
     try {
       ProjectOpenStrategy(project, myWorkbenchFacade).use { strategy ->
-        val offlineTail = { doc: Document ->
-          SwingUtilities.invokeLater {
-            strategy.openFileAsIs(doc)
-                .checkLegacyMilestones()
-                .checkEarliestStartConstraints()
-                .runUiTasks()
-                .onFetchResultChange(doc) {
-                  SwingUtilities.invokeLater {
-                    openProject(doc, project)
+        // Run coroutine which fetches document and wait until it sends the result to the channel.
+        GlobalScope.launch(Dispatchers.IO) {
+          val successChannel = Channel<Document>()
+
+          strategy.open(document, successChannel)
+          try {
+            val doc = successChannel.receive()
+            onFinish?.send(true)
+            // If document is obtained, we need to run further steps.
+            // Because if historical reasons they run in Swing thread (they may modify the state of Swing components)
+            SwingUtilities.invokeLater {
+              beforeClose()
+              project.close()
+              strategy.openFileAsIs(doc)
+                  .checkLegacyMilestones()
+                  .checkEarliestStartConstraints()
+                  .runUiTasks()
+                  .onFetchResultChange(doc) {
+                    SwingUtilities.invokeLater {
+                      openProject(doc, project, null)
+                    }
                   }
+            }
+          } catch (ex: Exception) {
+            when (ex) {
+              // If channel was closed with a cause and it was because of HTTP 403, we show UI for sign-in
+              is ForbiddenException -> {
+                signin {
+                  openProject(document, project, null)
                 }
+              }
+              else -> {
+                GPLogger.log(DocumentException("Can't open document $document", ex ))
+                onFinish?.close(ex)
+              }
+            }
           }
         }
-        strategy.open(document, offlineTail)
       }
     } catch (e: Exception) {
       throw DocumentException("Can't open document $document", e)
@@ -262,7 +324,7 @@ class ProjectUIFacadeImpl(internal val myWorkbenchFacade: UIFacade, private val 
   }
 
   override fun createProject(project: IGanttProject) {
-    if (false == ensureProjectSaved(project)) {
+    if (!ensureProjectSaved(project)) {
       return
     }
     beforeClose()
